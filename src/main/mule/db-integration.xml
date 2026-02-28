@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ftp="http://www.mulesoft.org/schema/mule/ftp"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/ftp http://www.mulesoft.org/schema/mule/ftp/current/mule-ftp.xsd">
+
+    <!-- ================= DATABASE CONFIG ================= -->
+    <db:config name="MySQL_Config">
+        <db:generic-connection
+            url="jdbc:mysql://localhost:3306/testdb?useSSL=false&amp;allowPublicKeyRetrieval=true"
+            driverClassName="com.mysql.cj.jdbc.Driver"
+            user="root"
+            password="system" />
+    </db:config>
+
+    <!-- ================= FILE CONFIG ================= -->
+    <file:config name="File_Config" doc:name="File Config" doc:id="0ed54735-196e-432b-85bd-f21fea000ebd">
+        <file:connection workingDir="C:\mule-demo" />
+    </file:config>
+
+    <!-- ================= MAIN FLOW ================= -->
+    <flow name="file-to-db-flow">
+
+        <!-- 
+            FIX 1: File Listener - reads CSV files from 'input' folder 
+            and auto-moves them to 'processing' folder while reading.
+            The 'moveToDirectory' handles moving to processing automatically.
+        -->
+        <file:listener
+            directory="input"
+            moveToDirectory="processing"
+            config-ref="File_Config"
+            outputMimeType="application/csv">
+            <scheduling-strategy>
+                <fixed-frequency timeUnit="DAYS"/>
+            </scheduling-strategy>
+        </file:listener>
+
+        <!-- Logger: Log file name from attributes -->
+        <logger level="INFO"
+                message="Processing file: #[attributes.fileName]"
+                doc:name="Log File Name" />
+
+        <!-- 
+            FIX 2: Store the file name in a variable BEFORE transforming payload.
+            This is critical because after the Transform and inside Batch,
+            payload is no longer the file attributes.
+            We'll use this variable later for file:move and error handling.
+        -->
+        <set-variable
+            variableName="fileName"
+            value="#[attributes.fileName]"
+            doc:name="Store File Name" />
+
+        <!-- CSV to JSON Transform -->
+        <ee:transform doc:name="CSV to JSON">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map (item) -> {
+    emp_id: item.empId as Number,
+    first_name: item.firstName,
+    last_name: item.lastName,
+    email: item.email,
+    department: item.department,
+    salary: item.salary as Number,
+    // FIX: Convert date to MySQL-compatible String format "yyyy-MM-dd"
+    // MySQL JDBC driver cannot accept DataWeave Date type directly via named params
+    joining_date: item.joiningDate as Date {format: "M/d/yyyy"} as String {format: "yyyy-MM-dd"}
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- 
+            FIX 3: Batch Job
+            - batch:on-complete phase is used to move the file after batch finishes
+              (batch is asynchronous; post-batch logic must go inside on-complete)
+            - Inside the batch step, payload is each individual record (not the full list)
+            - We store the record in a variable before db:select so that after select,
+              we still have the original record to use for update/insert
+        -->
+        <batch:job jobName="db-integrationBatch_Job" doc:id="a3d572bc-dd12-4ff3-8f73-f09306145aad">
+
+            <batch:process-records>
+                <batch:step name="validate-and-upsert" doc:id="68eb56ee-573c-48c4-bc78-7fccb2aac4d8">
+
+                    <!-- FIX 4: Validate salary BEFORE any DB operation -->
+                    <choice doc:name="Salary Validation" doc:id="05d6794a-2289-4ea8-bde1-0420045d331d">
+                        <when expression="#[payload.salary &lt; 30000]">
+                            <raise-error
+                                doc:name="Raise Low Salary Error"
+                                doc:id="4d5f64f0-8b54-42ac-86af-6ab607893a2a"
+                                type="VALIDATION:LOW_SALARY"
+                                description="Salary below minimum threshold of 30000"/>
+                        </when>
+                    </choice>
+
+                    <!-- FIX 5: Store the current record in a variable BEFORE db:select.
+                         After db:select executes, payload becomes the SELECT result (a list).
+                         We need the original record for the UPDATE and INSERT operations. -->
+                    <set-variable
+                        variableName="currentRecord"
+                        value="#[payload]"
+                        doc:name="Store Current Record" />
+
+                    <!-- FIX 6: Logger now has a meaningful message -->
+                    <logger
+                        level="INFO"
+                        doc:name="Log Record"
+                        doc:id="18a94dcd-e2d5-4e57-be1c-88ca0947711b"
+                        message="Processing record - emp_id: #[payload.emp_id], name: #[payload.first_name] #[payload.last_name]" />
+
+                    <!-- Check if employee already exists in DB -->
+                    <db:select doc:name="Check Employee Exists" doc:id="6f3c6247-c67e-4199-8a17-5a257b6290c7" config-ref="MySQL_Config">
+                        <db:sql><![CDATA[
+SELECT emp_id FROM employees WHERE emp_id = :emp_id
+                        ]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+    emp_id: vars.currentRecord.emp_id
+}]]]></db:input-parameters>
+                    </db:select>
+
+                    <!-- FIX 7: Use vars.currentRecord for update/insert params
+                         because payload here is now the SELECT result list.
+                         sizeOf(payload) > 0 means the employee exists → UPDATE
+                         otherwise → INSERT -->
+                    <choice doc:name="Upsert Decision" doc:id="efc8a3e2-8f5e-4f6a-913f-a248ff41fbba">
+                        <when expression="#[sizeOf(payload) &gt; 0]">
+                            <!-- Employee exists → UPDATE -->
+                            <db:update doc:name="Update Employee" doc:id="1dee210f-8c5d-4cd5-bed2-3fe041ef7b7e" config-ref="MySQL_Config">
+                                <db:sql><![CDATA[
+UPDATE employees
+SET first_name   = :first_name,
+    last_name    = :last_name,
+    email        = :email,
+    department   = :department,
+    salary       = :salary,
+    joining_date = :joining_date
+WHERE emp_id = :emp_id
+                                ]]></db:sql>
+                                <!-- FIX: Use vars.currentRecord instead of payload -->
+                                <db:input-parameters><![CDATA[#[vars.currentRecord]]]></db:input-parameters>
+                            </db:update>
+                            <logger level="INFO" message="Updated emp_id: #[vars.currentRecord.emp_id]" doc:name="Log Update" />
+                        </when>
+                        <otherwise>
+                            <!-- Employee does not exist → INSERT -->
+                            <db:insert doc:name="Insert Employee" doc:id="890850f9-4305-43f3-867d-c3240e070009" config-ref="MySQL_Config">
+                                <db:sql><![CDATA[
+INSERT INTO employees
+    (emp_id, first_name, last_name, email, department, salary, joining_date)
+VALUES
+    (:emp_id, :first_name, :last_name, :email, :department, :salary, :joining_date)
+                                ]]></db:sql>
+                                <!-- FIX: Use vars.currentRecord instead of payload -->
+                                <db:input-parameters><![CDATA[#[vars.currentRecord]]]></db:input-parameters>
+                            </db:insert>
+                            <logger level="INFO" message="Inserted emp_id: #[vars.currentRecord.emp_id]" doc:name="Log Insert" />
+                        </otherwise>
+                    </choice>
+
+                </batch:step>
+            </batch:process-records>
+
+            <!-- 
+                FIX 8: Use batch:on-complete to move the file AFTER the batch finishes.
+                Batch runs asynchronously, so placing file:move after batch:job in the
+                main flow would execute BEFORE the batch completes. 
+                on-complete is the correct place for post-batch file handling.
+            -->
+            <batch:on-complete>
+                <logger
+                    level="INFO"
+                    doc:name="Batch Complete Logger"
+                    message="Batch job complete. Total records: #[payload.loadedRecords], Failed: #[payload.failedRecords]" />
+
+                <!-- 
+                    FIX: sourcePath in file:move does NOT evaluate DataWeave expressions directly.
+                    Use ee:transform to build the full path as payload, then reference it.
+                    We set the resolved path into a variable first, then use it.
+                -->
+                <ee:transform doc:name="Build Source Path">
+                    <ee:variables>
+                        <ee:set-variable variableName="sourceFilePath"><![CDATA[%dw 2.0
+output application/java
+---
+"processing/" ++ vars.fileName]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+                <!-- Move file to 'processed' folder using the evaluated path variable -->
+                <file:move
+                    doc:name="Move to Processed"
+                    config-ref="File_Config"
+                    sourcePath="#[vars.sourceFilePath]"
+                    targetPath="processed" />
+
+                <logger level="INFO" message="File moved to processed: #[vars.fileName]" doc:name="Log File Moved" />
+            </batch:on-complete>
+
+        </batch:job>
+
+        <!-- 
+            FIX 9: Global Error Handler — use vars.fileName (not payload)
+            to correctly reference the file path in error scenarios.
+        -->
+        <error-handler>
+            <on-error-continue logException="true" doc:name="On Error Continue">
+                <logger
+                    level="ERROR"
+                    doc:name="Log Error"
+                    message="Error occurred while processing file '#[vars.fileName]': #[error.description]" />
+                <!-- FIX: Build the source path using ee:transform before file:move -->
+                <file:move doc:name="Move to Error" config-ref="File_Config" sourcePath="#[vars.sourceFilePath]" targetPath="error" />
+				<!-- [STUDIO:"Build Error Source Path"]<ee:transform doc:name="Build Error Source Path">
+                    <ee:variables>
+                        <ee:set-variable variableName="sourceFilePath"><![CDATA[%dw 2.0
+output application/java
+&#45;&#45;-
+"processing/" ++ vars.fileName&#93;&#93;></ee:set-variable>
+                    </ee:variables>
+                </ee:transform> [STUDIO] -->
+                <!-- Move the file to 'error' folder for manual inspection -->
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+</mule>
